@@ -18,6 +18,7 @@ Make sure the datasets are in the `datasets` folder:
    - `2015_Street_Tree_Census_-_Tree_Data_20261020.csv`
    - `Heat_Vulnerability_Index_Rankings_20261020.csv`
    - `nyc_zcta_boundaries.geojson`
+   - `canopy_jurisdiction_landuse_borough.csv`
 
 4. Run these commands in the terminal to see dashboard
 
@@ -30,6 +31,7 @@ python open_map.py
 - NYC Heat Vulnerability Index
 - U.S. Census Bureau 2024 American Community Survey 5-Year Estimates
 - U.S. Census Bureau 2020 ZIP Code Tabulation Area boundaries
+- The Nature Conservancy
 - Map tiles © OpenStreetMap contributors
 
 ## Datasets/APIs used
@@ -45,6 +47,9 @@ American Community Survey 5-Year Data API
 
 NYC Zip Code Boundaries data
 - https://tigerweb.geo.census.gov/arcgis/rest/services/Census2020/PUMA_TAD_TAZ_UGA_ZCTA/MapServer/2
+
+Canopy Jurisdiction in each Borough
+- https://zenodo.org/records/5210261?preview_file=canopy_jurisdiction_landuse_borough.zip
 
 # Analysis on Dashboard
 
