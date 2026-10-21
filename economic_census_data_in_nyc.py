@@ -1,11 +1,12 @@
-"""Add ACS 5-year demographic and housing layers to the NYC ZIP-code map.
+"""Build an NYC map of street trees, heat vulnerability, and ACS data.
 
-Paste your Census API key into ``CENSUS_API_KEY`` below, then run:
+Set your Census API key in the local ``.env`` file, then run:
 
     python economic_census_data_in_nyc.py
 
 The first run downloads 2024 ACS 5-year ZCTA estimates and caches them under
 ``datasets``. Later runs reuse the cache; pass ``--refresh-acs`` to update it.
+Edit the map title and introduction in ``_html`` to personalize the project.
 """
 
 import argparse
@@ -25,6 +26,12 @@ from heat_vulnerability_in_nyc import (
     load_boundaries,
     read_hvi_ranks,
     read_tree_counts,
+)
+from canopy_by_borough import (
+    BOUNDARIES as BOROUGH_BOUNDARIES,
+    DATASET as CANOPY_DATASET,
+    load_boundaries as load_borough_boundaries,
+    read_canopy_data,
 )
 
 
@@ -149,6 +156,16 @@ METRICS = {
 TREE_COLORS = ["#edf8d5", "#c7e9b4", "#7fcdbb", "#41ab5d", "#006837"]
 HVI_COLORS = ["#fff7bc", "#fec44f", "#fe9929", "#ec7014", "#cc4c02"]
 RACE_COLORS = ["#f2f0f7", "#cbc9e2", "#9e9ac8", "#756bb1", "#54278f"]
+RACE_GROUP_COLORS = {
+    "White, non-Hispanic": "#1b9e77",
+    "Black, non-Hispanic": "#d95f02",
+    "American Indian / Alaska Native, non-Hispanic": "#7570b3",
+    "Asian, non-Hispanic": "#e7298a",
+    "Native Hawaiian / Pacific Islander, non-Hispanic": "#66a61e",
+    "Some other race, non-Hispanic": "#e6ab02",
+    "Two or more races, non-Hispanic": "#a6761d",
+    "Hispanic or Latino, any race": "#1f78b4",
+}
 
 
 def _estimate(value: str) -> int | None:
@@ -236,6 +253,10 @@ def fetch_acs_data(api_key: str, nyc_zip_codes: set[str]) -> dict:
         estimates[zip_code] = {
             "median_income": raw["B19013_001E"],
             "poverty_rate": _percent(raw["B17001_002E"], poverty_denominator),
+            "race_counts": {
+                group: raw[variable]
+                for group, variable in RACE_VARIABLES.items()
+            },
             "race_shares": {
                 group: _percent(raw[variable], population)
                 for group, variable in RACE_VARIABLES.items()
@@ -264,7 +285,12 @@ def load_acs_data(
     if cache_path.exists() and not refresh:
         with cache_path.open("r", encoding="utf-8") as cache_file:
             cached = json.load(cache_file)
-        if cached.get("year") == ACS_YEAR and isinstance(cached.get("data"), dict):
+        data = cached.get("data")
+        if (
+            cached.get("year") == ACS_YEAR
+            and isinstance(data, dict)
+            and all("race_counts" in estimate for estimate in data.values())
+        ):
             return cached
 
     fetched = fetch_acs_data(api_key, nyc_zip_codes)
@@ -279,6 +305,8 @@ def _map_data(
     tree_dataset: Path,
     hvi_dataset: Path,
     boundaries_path: Path,
+    canopy_dataset: Path,
+    borough_boundaries_path: Path,
     acs_cache: Path,
     status: str,
     api_key: str,
@@ -294,6 +322,8 @@ def _map_data(
     }
     acs = load_acs_data(acs_cache, boundary_zip_codes, api_key, refresh_acs)
     acs_data = acs["data"]
+    canopy_data = read_canopy_data(canopy_dataset)
+    borough_boundaries = load_borough_boundaries(borough_boundaries_path)
 
     matched_tree_codes = set(tree_counts) & boundary_zip_codes
     matched_hvi_codes = set(hvi_ranks) & boundary_zip_codes
@@ -305,6 +335,8 @@ def _map_data(
     )
     return {
         "boundaries": boundaries,
+        "canopyBoundaries": borough_boundaries,
+        "canopyData": canopy_data,
         "treeCounts": tree_counts,
         "treeTotal": tree_total,
         "treeMappedTotal": sum(
@@ -327,6 +359,8 @@ def create_map(
     tree_dataset: Path,
     hvi_dataset: Path,
     boundaries_path: Path,
+    canopy_dataset: Path,
+    borough_boundaries_path: Path,
     acs_cache: Path,
     output: Path,
     status: str,
@@ -338,6 +372,8 @@ def create_map(
             tree_dataset,
             hvi_dataset,
             boundaries_path,
+            canopy_dataset,
+            borough_boundaries_path,
             acs_cache,
             status,
             api_key,
@@ -368,35 +404,56 @@ def _html(data: str) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NYC Community Data by ZIP Code</title>
+  <title>NYC, Block by Block</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <style>
     html, body, #map {{ height: 100%; margin: 0; }}
-    body {{ font: 14px/1.4 system-ui, sans-serif; color: #183128; }}
-    .panel {{ position: absolute; z-index: 1000; top: 16px; left: 56px;
-      width: min(340px, calc(100vw - 88px)); max-height: calc(100vh - 64px);
-      overflow-y: auto; padding: 16px; background: #fff; border-radius: 10px;
-      box-shadow: 0 2px 14px #18312833; }}
-    h1 {{ font-size: 18px; margin: 0 0 5px; }}
-    #summary {{ color: #466257; margin: 0 0 12px; }}
-    #note {{ color: #60746c; font-size: 12px; margin: 8px 0 0; }}
-    label {{ display: block; margin-top: 9px; font-weight: 600; }}
-    select, input {{ width: 100%; margin-top: 5px; }}
-    .legend {{ display: flex; justify-content: space-between; margin-top: 12px;
-      color: #466257; font-size: 12px; gap: 8px; }}
-    .swatches {{ display: flex; gap: 7px; margin-top: 6px; }}
-    .swatches span {{ flex: 1; height: 9px; border-radius: 5px; }}
-    .leaflet-container {{ background: #e9f0ed; }}
+    body {{ font: 14px/1.5 system-ui, sans-serif; color: #25352f; }}
+    .panel {{ position: absolute; z-index: 1000; top: 20px; left: 64px;
+      width: min(310px, calc(100vw - 104px)); max-height: calc(100vh - 72px);
+      overflow-y: auto; padding: 20px; background: #fffdf8; border-radius: 8px;
+      box-shadow: 0 3px 18px #25352f24; }}
+    .eyebrow {{ margin: 0 0 4px; color: #52745e; font-size: 11px;
+      font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }}
+    h1 {{ font-family: Georgia, "Times New Roman", serif; font-size: 26px;
+      font-weight: 500; letter-spacing: -.03em; line-height: 1.1;
+      margin: 0 0 8px; }}
+    .intro {{ color: #64736b; margin: 0 0 16px; }}
+    label {{ display: block; margin-top: 12px; font-size: 12px;
+      font-weight: 700; }}
+    select {{ box-sizing: border-box; width: 100%; margin-top: 5px; padding: 8px;
+      border: 1px solid #d6ddd5; border-radius: 5px; background: white;
+      color: inherit; font: inherit; }}
+    #summary {{ color: #52745e; font-size: 12px; margin: 12px 0 0; }}
+    .legend {{ display: flex; justify-content: space-between; margin-top: 14px;
+      color: #64736b; font-size: 11px; gap: 8px; }}
+    .swatches {{ display: flex; gap: 5px; margin-top: 6px; }}
+    .swatches span {{ flex: 1; height: 8px; border-radius: 4px; }}
+    .category-legend {{ display: grid; grid-template-columns: 1fr 1fr;
+      gap: 5px 9px; margin-top: 8px; color: #53645a; font-size: 10px; }}
+    .category-legend span {{ display: flex; align-items: flex-start; gap: 5px; }}
+    .category-legend i {{ flex: 0 0 9px; height: 9px; margin-top: 2px;
+      border-radius: 50%; }}
+    #note {{ color: #78847d; font-size: 11px; margin: 9px 0 0; }}
+    .leaflet-container {{ background: #e8eee9; }}
+    @media (max-width: 520px) {{
+      .panel {{ top: 12px; left: 54px; width: min(280px, calc(100vw - 82px));
+        padding: 14px; }}
+      h1 {{ font-size: 22px; }}
+    }}
   </style>
 </head>
 <body>
   <div id="map" role="application" aria-label="NYC community data by ZIP code"></div>
   <section class="panel">
-    <h1>NYC Community Data by ZIP Code</h1>
-    <label for="metric">Map layer</label>
+    <p class="eyebrow">A New York City data project</p>
+    <h1>NYC, Block by Block</h1>
+    <p class="intro">Explore street trees, heat, and neighborhood patterns across the five boroughs.</p>
+    <label for="metric">Explore a map layer</label>
     <select id="metric">
       <option value="trees">Street tree count</option>
       <option value="hvi">Heat Vulnerability Index</option>
+      <option value="canopy">Tree canopy by borough</option>
       <optgroup label="Income and poverty">
         <option value="median_income">Median household income</option>
         <option value="poverty_rate">Population below poverty level</option>
@@ -409,14 +466,31 @@ def _html(data: str) -> str:
       </optgroup>
     </select>
     <div id="raceControl" hidden>
+      <label for="raceMode">Race / ethnicity view</label>
+      <select id="raceMode">
+        <option value="city_share">Share of group's NYC-wide population</option>
+        <option value="dominant">Largest group in each ZIP</option>
+      </select>
       <label for="raceGroup">Race / ethnicity group</label>
       <select id="raceGroup">{race_options}</select>
     </div>
+    <div id="canopyControl" hidden>
+      <label for="canopyYear">Canopy year</label>
+      <select id="canopyYear">
+        <option value="2010">2010</option>
+        <option value="2017" selected>2017</option>
+      </select>
+      <label for="canopyLandType">Land type</label>
+      <select id="canopyLandType">
+        <option value="All">All land types</option>
+        <option value="Developed">Developed</option>
+        <option value="Natural">Natural</option>
+      </select>
+    </div>
     <p id="summary"></p>
-    <label for="opacity">Map opacity</label>
-    <input id="opacity" type="range" min="20" max="100" value="75">
     <div class="legend"><span id="legendLow"></span><span id="legendHigh"></span></div>
     <div class="swatches" id="swatches" aria-hidden="true"></div>
+    <div class="category-legend" id="categoryLegend" hidden></div>
     <p id="note"></p>
   </section>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -432,13 +506,46 @@ def _html(data: str) -> str:
     const treeColors = {json.dumps(TREE_COLORS)};
     const hviColors = {json.dumps(HVI_COLORS)};
     const raceColors = {json.dumps(RACE_COLORS)};
+    const raceGroupColors = {json.dumps(RACE_GROUP_COLORS, separators=(",", ":"))};
+    const canopyColors = ["#f1f7e8", "#cfe5bd", "#91c68a", "#4b9b62", "#17633c"];
     const metricSelect = document.getElementById("metric");
+    const raceModeSelect = document.getElementById("raceMode");
     const raceGroupSelect = document.getElementById("raceGroup");
-    const opacityControl = document.getElementById("opacity");
+    const canopyYearSelect = document.getElementById("canopyYear");
+    const canopyLandTypeSelect = document.getElementById("canopyLandType");
     const treeValues = Object.values(data.treeCounts).sort((a, b) => a - b);
     const treeBreaks = [0.2, 0.4, 0.6, 0.8].map(percentile =>
       treeValues[Math.floor((treeValues.length - 1) * percentile)] || 0
     );
+    const cityRaceTotals = Object.fromEntries(
+      Object.keys(raceGroupColors).map(group => [
+        group,
+        Object.values(data.acsMetrics).reduce(
+          (total, estimate) => total + (estimate.race_counts[group] || 0),
+          0
+        )
+      ])
+    );
+
+    function raceShare(zipCode, group) {{
+      const estimate = data.acsMetrics[zipCode];
+      const total = cityRaceTotals[group];
+      const count = estimate && estimate.race_counts[group];
+      return count === undefined || count === null || !total
+        ? undefined
+        : 100 * count / total;
+    }}
+
+    function dominantRace(zipCode) {{
+      const estimate = data.acsMetrics[zipCode];
+      if (!estimate) return undefined;
+      const entries = Object.entries(estimate.race_counts)
+        .filter(([, count]) => count !== undefined && count !== null);
+      if (!entries.length) return undefined;
+      return entries.reduce((largest, current) =>
+        current[1] > largest[1] ? current : largest
+      )[0];
+    }}
 
     function metricValue(zipCode) {{
       const metric = metricSelect.value;
@@ -446,15 +553,19 @@ def _html(data: str) -> str:
       if (metric === "hvi") return data.hviRanks[zipCode];
       const estimate = data.acsMetrics[zipCode];
       if (!estimate) return undefined;
-      if (metric === "race") return estimate.race_shares[raceGroupSelect.value];
+      if (metric === "race") {{
+        return raceModeSelect.value === "dominant"
+          ? dominantRace(zipCode)
+          : raceShare(zipCode, raceGroupSelect.value);
+      }}
       return estimate[metric];
     }}
 
     function colorIndex(value) {{
       if (value === undefined || value === null) return -1;
       if (metricSelect.value === "hvi") return value - 1;
-      if (metricSelect.value === "race") {{
-        return Math.min(4, Math.floor(value / 20));
+      if (metricSelect.value === "race" && raceModeSelect.value === "dominant") {{
+        return Object.keys(raceGroupColors).indexOf(value);
       }}
       if (metricSelect.value === "trees") {{
         const index = treeBreaks.findIndex(limit => value <= limit);
@@ -474,6 +585,10 @@ def _html(data: str) -> str:
     function palette() {{
       if (metricSelect.value === "trees") return treeColors;
       if (metricSelect.value === "hvi") return hviColors;
+      if (metricSelect.value === "canopy") return canopyColors;
+      if (metricSelect.value === "race" && raceModeSelect.value === "dominant") {{
+        return Object.values(raceGroupColors);
+      }}
       if (metricSelect.value === "race") return raceColors;
       return metricConfig[metricSelect.value].colors;
     }}
@@ -486,8 +601,54 @@ def _html(data: str) -> str:
         color: "#ffffff",
         weight: 1,
         fillColor: index < 0 ? "#d9dfdc" : colors[index],
-        fillOpacity: Number(opacityControl.value) / 100
+        fillOpacity: 0.82
       }};
+    }}
+
+    function canopyRecord(borough) {{
+      return data.canopyData[borough]?.[canopyLandTypeSelect.value];
+    }}
+
+    function canopyPercent(borough) {{
+      const record = canopyRecord(borough);
+      return record?.[`canopy${{canopyYearSelect.value}}_percent`];
+    }}
+
+    function canopyStyle(feature) {{
+      const percent = canopyPercent(feature.properties.borough);
+      const breaks = [10, 15, 20, 25];
+      const index = percent === undefined || percent === null
+        ? -1
+        : breaks.findIndex(limit => percent < limit);
+      return {{
+        color: "#ffffff",
+        weight: 2,
+        fillColor: index < 0
+          ? (percent === undefined || percent === null
+            ? "#d9dfdc"
+            : canopyColors[canopyColors.length - 1])
+          : canopyColors[index],
+        fillOpacity: 0.86
+      }};
+    }}
+
+    function canopyTooltip(borough) {{
+      const record = canopyRecord(borough);
+      if (!record) return `<strong>${{borough}}</strong><br>No canopy data`;
+      const year = canopyYearSelect.value;
+      const area = record[`canopy${{year}}_acres`];
+      const percent = record[`canopy${{year}}_percent`];
+      const netChange = record.canopy2017_acres - record.canopy2010_acres;
+      const percentagePointChange =
+        record.canopy2017_percent - record.canopy2010_percent;
+      return `<strong>${{borough}}</strong><br>` +
+        `${{year}} canopy: ${{percent.toFixed(1)}}% ` +
+        `(${{area.toLocaleString(undefined, {{maximumFractionDigits: 0}})}} acres)` +
+        `<br>Land area: ${{record.acreage.toLocaleString(undefined, {{maximumFractionDigits: 0}})}} acres` +
+        `<br>2010–2017 net change: ${{netChange >= 0 ? "+" : ""}}` +
+        `${{netChange.toLocaleString(undefined, {{maximumFractionDigits: 0}})}} canopy acres` +
+        `<br>Change: ${{percentagePointChange >= 0 ? "+" : ""}}` +
+        `${{percentagePointChange.toFixed(1)}} percentage points`;
     }}
 
     function formatValue(zipCode, value) {{
@@ -498,9 +659,7 @@ def _html(data: str) -> str:
         return `${{Number(value).toLocaleString()}} ${{status}}trees`;
       }}
       if (metric === "hvi") return `HVI rank: ${{value}} of 5`;
-      const unit = metric === "race"
-        ? "percent of population"
-        : metricConfig[metric].unit;
+      const unit = metricConfig[metric].unit;
       if (unit === "currency") {{
         return `$${{Number(value).toLocaleString()}}`;
       }}
@@ -514,8 +673,27 @@ def _html(data: str) -> str:
         : metric === "hvi"
           ? "Heat Vulnerability Index"
           : metric === "race"
-            ? raceGroupSelect.value
+            ? raceModeSelect.value === "dominant"
+              ? "Largest group"
+              : raceGroupSelect.value
             : metricConfig[metric].label;
+      if (metric === "race") {{
+        const estimate = data.acsMetrics[zipCode];
+        if (raceModeSelect.value === "dominant") {{
+          const group = metricValue(zipCode);
+          const count = group && estimate.race_counts[group];
+          return `<strong>ZIP ${{zipCode}}</strong><br>Largest group: ` +
+            (group ? `${{group}} (${{count.toLocaleString()}} people)` : "No estimate available");
+        }}
+        const group = raceGroupSelect.value;
+        const count = estimate && estimate.race_counts[group];
+        const share = metricValue(zipCode);
+        return `<strong>ZIP ${{zipCode}}</strong><br>${{group}}: ` +
+          (share === undefined
+            ? "No estimate available"
+            : `${{share.toFixed(2)}}% of NYC-wide group population ` +
+              `(${{count.toLocaleString()}} of ${{cityRaceTotals[group].toLocaleString()}} people)`);
+      }}
       return `<strong>ZIP ${{zipCode}}</strong><br>${{label}}: ` +
         formatValue(zipCode, metricValue(zipCode));
     }}
@@ -523,11 +701,61 @@ def _html(data: str) -> str:
     function updateMap() {{
       const metric = metricSelect.value;
       const colors = palette();
+      const isDominantRace = metric === "race" && raceModeSelect.value === "dominant";
+      const isCanopy = metric === "canopy";
+      if (isCanopy && map.hasLayer(zipLayer)) {{
+        map.removeLayer(zipLayer);
+        boroughLayer.addTo(map);
+        map.fitBounds(boroughLayer.getBounds(), {{ padding: [20, 20] }});
+      }} else if (!isCanopy && map.hasLayer(boroughLayer)) {{
+        map.removeLayer(boroughLayer);
+        zipLayer.addTo(map);
+        map.fitBounds(zipLayer.getBounds(), {{ padding: [20, 20] }});
+      }}
       document.getElementById("raceControl").hidden = metric !== "race";
+      document.getElementById("canopyControl").hidden = !isCanopy;
+      document.getElementById("raceGroup").hidden =
+        isDominantRace;
+      document.getElementById("swatches").hidden = isDominantRace;
+      document.getElementById("categoryLegend").hidden = !isDominantRace;
+      document.getElementById("categoryLegend").innerHTML = isDominantRace
+        ? Object.entries(raceGroupColors).map(([group, color]) =>
+            `<span><i style="background:${{color}}"></i>${{group}}</span>`
+          ).join("")
+        : "";
       document.getElementById("swatches").innerHTML = colors
         .map(color => `<span style="background:${{color}}"></span>`).join("");
 
-      if (metric === "trees") {{
+      if (isCanopy) {{
+        const percentages = data.canopyBoundaries.features
+          .map(feature => canopyPercent(feature.properties.borough))
+          .filter(value => value !== undefined && value !== null);
+        const average = percentages.length
+          ? percentages.reduce((sum, value) => sum + value, 0) / percentages.length
+          : 0;
+        document.getElementById("legendLow").textContent = "0% canopy";
+        document.getElementById("legendHigh").textContent = "25%+ canopy";
+        document.getElementById("summary").textContent =
+          `${{percentages.length}} boroughs · ${{average.toFixed(1)}}% average canopy in ${{canopyYearSelect.value}}`;
+        document.getElementById("note").textContent =
+          `${{canopyLandTypeSelect.value === "All" ? "All land types" : canopyLandTypeSelect.value}} · Historical canopy estimates from 2010 and 2017. Hover a borough for acreage and change since 2010.`;
+        document.getElementById("swatches").innerHTML =
+          canopyColors.map(color => `<span style="background:${{color}}"></span>`).join("");
+      }} else if (metric === "race" && raceModeSelect.value === "dominant") {{
+        document.getElementById("legendLow").textContent = "Largest group in each ZIP";
+        document.getElementById("legendHigh").textContent = "";
+        document.getElementById("summary").textContent =
+          "ZIP codes are colored by their largest race / ethnicity group.";
+        document.getElementById("note").textContent =
+          "Shows the largest group (not necessarily a majority) using mutually exclusive ACS categories.";
+      }} else if (metric === "race") {{
+        document.getElementById("legendLow").textContent = "Smaller share of NYC group";
+        document.getElementById("legendHigh").textContent = "Larger share of NYC group";
+        document.getElementById("summary").textContent =
+          `${{data.acsMappedZipCodes}} ZIP areas · share of selected group's NYC-wide population`;
+        document.getElementById("note").textContent =
+          `${{raceGroupSelect.value}} residents in each ZIP as a share of all matching residents across the mapped NYC ZIP areas. Hover for counts.`;
+      }} else if (metric === "trees") {{
         document.getElementById("legendLow").textContent = "Fewer trees";
         document.getElementById("legendHigh").textContent = "More trees";
         document.getElementById("summary").textContent =
@@ -542,24 +770,27 @@ def _html(data: str) -> str:
         document.getElementById("note").textContent =
           `${{data.hviUnmappedZipCodes}} HVI ZIP codes have no matching boundary.`;
       }} else {{
-        const selectedMetric = metric === "race" ? null : metricConfig[metric];
-        document.getElementById("legendLow").textContent = metric === "race"
-          ? "0% of population" : selectedMetric.low;
-        document.getElementById("legendHigh").textContent = metric === "race"
-          ? "100% of population" : selectedMetric.high;
-        const label = metric === "race"
-          ? raceGroupSelect.value + " population share"
-          : selectedMetric.label;
+        const selectedMetric = metricConfig[metric];
+        document.getElementById("legendLow").textContent = selectedMetric.low;
+        document.getElementById("legendHigh").textContent = selectedMetric.high;
+        const label = selectedMetric.label;
         document.getElementById("summary").textContent =
           `${{data.acsMappedZipCodes}} ZIP areas with ACS estimates · ${{data.acsYear}} ACS 5-year`;
         document.getElementById("note").textContent =
           `${{label}}. ACS rates are calculated from published count estimates; gray areas have no estimate.`;
       }}
 
-      zipLayer.setStyle(polygonStyle);
-      zipLayer.eachLayer(layer =>
-        layer.setTooltipContent(tooltip(layer.feature.properties.ZCTA5))
-      );
+      if (isCanopy) {{
+        boroughLayer.setStyle(canopyStyle);
+        boroughLayer.eachLayer(layer =>
+          layer.setTooltipContent(canopyTooltip(layer.feature.properties.borough))
+        );
+      }} else {{
+        zipLayer.setStyle(polygonStyle);
+        zipLayer.eachLayer(layer =>
+          layer.setTooltipContent(tooltip(layer.feature.properties.ZCTA5))
+        );
+      }}
     }}
 
     const zipLayer = L.geoJSON(data.boundaries, {{
@@ -573,9 +804,22 @@ def _html(data: str) -> str:
       }}
     }}).addTo(map);
 
+    const boroughLayer = L.geoJSON(data.canopyBoundaries, {{
+      style: canopyStyle,
+      onEachFeature: (feature, layer) => {{
+        layer.bindTooltip(canopyTooltip(feature.properties.borough));
+        layer.on({{
+          mouseover: () => layer.setStyle({{ color: "#183128", weight: 3 }}),
+          mouseout: () => layer.setStyle(canopyStyle(feature))
+        }});
+      }}
+    }});
+
     metricSelect.addEventListener("change", updateMap);
+    raceModeSelect.addEventListener("change", updateMap);
     raceGroupSelect.addEventListener("change", updateMap);
-    opacityControl.addEventListener("input", () => zipLayer.setStyle(polygonStyle));
+    canopyYearSelect.addEventListener("change", updateMap);
+    canopyLandTypeSelect.addEventListener("change", updateMap);
     if (zipLayer.getLayers().length) {{
       map.fitBounds(zipLayer.getBounds(), {{ padding: [20, 20] }});
     }}
@@ -603,6 +847,14 @@ def main() -> None:
         help="Path to the cached Census ZIP Code Tabulation Area boundaries.",
     )
     parser.add_argument(
+        "--canopy-dataset", type=Path, default=CANOPY_DATASET,
+        help="Path to the canopy jurisdiction CSV.",
+    )
+    parser.add_argument(
+        "--borough-boundaries", type=Path, default=BOROUGH_BOUNDARIES,
+        help="Path to cached Census borough boundaries (downloaded if missing).",
+    )
+    parser.add_argument(
         "--acs-cache", type=Path, default=ACS_CACHE,
         help="Path to the cached ACS estimates.",
     )
@@ -620,7 +872,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    for path in (args.tree_dataset, args.hvi_dataset, args.boundaries):
+    for path in (
+        args.tree_dataset,
+        args.hvi_dataset,
+        args.boundaries,
+        args.canopy_dataset,
+    ):
         if not path.is_file():
             parser.error(f"Required data file does not exist: {path}")
 
@@ -629,6 +886,8 @@ def main() -> None:
             args.tree_dataset,
             args.hvi_dataset,
             args.boundaries,
+            args.canopy_dataset,
+            args.borough_boundaries,
             args.acs_cache,
             args.output,
             args.status,
@@ -637,7 +896,7 @@ def main() -> None:
         )
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
         parser.error(str(error))
-    print(f"Created {args.output} with ACS {ACS_YEAR} data.")
+    print(f"Created {args.output} with ACS {ACS_YEAR} data and borough canopy layers.")
 
 
 if __name__ == "__main__":
